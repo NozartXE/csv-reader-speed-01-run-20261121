@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/csv-reader-speed-01-run-20261121/NozartXE/csv-reader-speed-01-run-20261121/rank.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 [![reward](https://make.fun/badge/csv-reader-speed-01-run-20261121/NozartXE/csv-reader-speed-01-run-20261121/reward.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 
-A faster drop-in for csv-reader 1.0.0: reads broken CSV files (BOM, CRLF/LF/lone-CR, quoted fields, doubled quotes, quote junk, unterminated quotes, short/long rows) and returns exactly the same `{columns, rows, errors}` — about 2x faster than the house baseline on the practice and realistic corpora, by jumping between delimiters with `indexOf` instead of stepping character by character.
+A faster drop-in for csv-reader 1.0.0: reads broken CSV files (BOM, CRLF/LF/lone-CR, quoted fields, doubled quotes, quote junk, unterminated quotes, short/long rows) and returns exactly the same `{columns, rows, errors}`. Measured with interleaved A/B runs against the house baseline on the dev machine it is about 2.2–3.0x faster on the practice and realistic corpora (cold-process runs agree), by scanning between delimiters with regex searches instead of stepping character by character, and by memoising failed closing-quote searches so unterminated quotes cannot trigger quadratic rescans. On files made of very short fields, or dense with malformed quotes, it can be slower than the baseline.
 
 ## Run it
 
