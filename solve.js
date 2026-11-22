@@ -1,11 +1,13 @@
 // Fast drop-in for csv-reader 1.0.0: identical {columns, rows, errors} output,
 // reached by scanning each field exactly once for its next delimiter instead
 // of stepping character by character. Single left-to-right pass over the
-// input text; per field, one native scan finds the first of {comma, LF, CR}
-// (plain fields) or of {quote, CR, LF} (quoted normalisation), CRs are
-// resolved inline by looking at the one character after them, and no
-// per-field closures or result objects are allocated — field results travel
-// through the fValue/fEnded/fAdded closure variables.
+// input text; per plain field, native indexOf scans find the earlier of the
+// next comma and the next LF and an amortised lookup finds the next CR (a
+// field holding a CR beyond the CRLF partner takes a regex scan instead),
+// per quoted field one scan finds the first of {quote, CR, LF} for
+// normalisation, CRs are resolved inline by looking at the one character
+// after them, and no per-field closures or result objects are allocated —
+// field results travel through the fValue/fEnded/fAdded closure variables.
 //
 // Semantics (from the task spec, re-derived here, not copied from the
 // reference): BOM dropped at the very start; a record ends at LF or CRLF;
@@ -94,14 +96,130 @@ export function run(input) {
     return -1;
   }
 
+  // First CR at or after p, amortised over the whole parse: CR positions
+  // are visited once, in order (field starts never move backwards), and the
+  // "no CR from here on" answer is sticky, so the sparse-CR lookup costs
+  // one native scan per CR plus one final scan to end of input — never a
+  // rescan per field.
+  let crFrom = 0;
+  let crNext = -1;
+  let crInit = false;
+  function firstCr(p) {
+    if (!crInit || p < crFrom) {
+      crFrom = p;
+      crNext = text.indexOf('\r', p);
+      crInit = true;
+    }
+    while (crNext !== -1 && crNext < p) {
+      crFrom = crNext + 1;
+      crNext = text.indexOf('\r', crFrom);
+    }
+    return crNext;
+  }
+
   // Read one unquoted field starting at pos into fValue/fEnded/fAdded.
   // `head` is text already belonging to this field (the normalised quoted
   // part, when reading the junk after a closing quote, or '"' for the
   // unterminated re-read); fAdded counts characters appended after `head`.
-  // One scan finds the field's end: a comma or LF ends it, a CR is dropped
+  // Fast paths, cheapest first. Most fields are short (numbers, dates,
+  // codes, single words), so a charCodeAt prefix scan of up to 24 chars
+  // resolves them with no scan call at all: it stops at the first comma,
+  // LF or CR — a comma or LF ends the field cleanly (the prefix holds no
+  // CR, so there is nothing to drop), a CR ends it only as the CRLF
+  // partner of the LF right after it, and any other CR takes the slow
+  // path. A field running to end of input inside the prefix is resolved
+  // there too. Longer fields take the indexOf path: two native scans find
+  // the earlier of the next comma and the next LF; when no CR sits inside
+  // the field — or the only one is the CRLF partner of the LF that ends
+  // it — the value is a single slice. A CR anywhere else inside the field
+  // is rare (stray_cr records) and takes the slow path, which is the
+  // original regex scan, unchanged.
+  function readPlain(head) {
+    const start = pos;
+    let i = start;
+    const lim = start + 24 < n ? start + 24 : n;
+    while (i < lim) {
+      const c = text.charCodeAt(i);
+      if (c === 44 || c === 10 || c === 13) break;
+      i += 1;
+    }
+    if (i < n) {
+      const c = text.charCodeAt(i);
+      if (c === 44 || c === 10) {
+        if (c === 10) line += 1;
+        pos = i + 1;
+        const tail = start < i ? text.slice(start, i) : '';
+        fValue = head ? head + tail : tail;
+        fEnded = c === 44 ? 'comma' : 'line break';
+        fAdded = tail.length;
+        return;
+      }
+      if (c === 13 && text.charCodeAt(i + 1) === 10) {
+        line += 1;
+        pos = i + 2;
+        const tail = start < i ? text.slice(start, i) : '';
+        fValue = head ? head + tail : tail;
+        fEnded = 'line break';
+        fAdded = tail.length;
+        return;
+      }
+      if (c === 13) {
+        readPlainSlow(head);
+        return;
+      }
+      // i === lim < n and text[i] is an ordinary char: long field, the
+      // indexOf path below picks up from here (the prefix held no
+      // delimiter and no CR, so the scans may start at i).
+    } else {
+      // The prefix ran to end of input: no delimiter, no CR.
+      pos = n;
+      const tail = start < n ? text.slice(start, n) : '';
+      fValue = head ? head + tail : tail;
+      fEnded = 'end';
+      fAdded = tail.length;
+      return;
+    }
+    const ci = text.indexOf(',', i);
+    const li = text.indexOf('\n', i);
+    let end;
+    let ended;
+    let newPos;
+    if (li !== -1 && (ci === -1 || li < ci)) {
+      end = li;
+      ended = 'line break';
+      newPos = li + 1;
+    } else if (ci !== -1) {
+      end = ci;
+      ended = 'comma';
+      newPos = ci + 1;
+    } else {
+      end = n;
+      ended = 'end';
+      newPos = n;
+    }
+    let valueEnd = end;
+    const cr = firstCr(start);
+    if (cr !== -1 && cr < end) {
+      if (ended === 'line break' && cr === end - 1) {
+        valueEnd = end - 1;
+      } else {
+        readPlainSlow(head);
+        return;
+      }
+    }
+    if (ended === 'line break') line += 1;
+    pos = newPos;
+    const tail = start < valueEnd ? text.slice(start, valueEnd) : '';
+    fValue = head ? head + tail : tail;
+    fEnded = ended;
+    fAdded = tail.length;
+  }
+
+  // The original scan, kept for fields holding a CR: one regex pass finds
+  // each special in turn; a comma or LF ends the field, a CR is dropped
   // inline — a stray_cr, except a CR immediately before the LF that ends
   // the field, which is that LF's CRLF partner and is dropped silently.
-  function readPlain(head) {
+  function readPlainSlow(head) {
     let parts = null;
     let added = 0;
     let start = pos;
